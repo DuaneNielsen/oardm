@@ -3,7 +3,7 @@
 Minimal pytorch example provided
 
 ```python
-oython train_minimal.py
+python train_minimal.py
 ```
 
 Working on reproduction of CIFAR 10 results.
