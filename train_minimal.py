@@ -102,10 +102,10 @@ class AODM(nn.Module):
         return x.squeeze()
 
 
-if __name__ == '__main__':
+if __name__ == '__main__': 
 
     addm = AODM(D, K)
-    optim = torch.optim.Adam(addm.parameters(), lr=1e-3)
+    optim = torch.optim.Adam(addm.parameters(), lr=1e-3) 
 
     for epoch in range(3000):
         optim.zero_grad()
