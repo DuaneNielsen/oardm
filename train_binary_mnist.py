@@ -60,10 +60,10 @@ class AODM(pl.LightningModule):
         return torch.log_softmax(x, dim=3)
 
     def sample_t(self, N):
-        return torch.randint(1, self.d + 1, (N, 1, 1))
+        return torch.randint(1, self.d + 1, (N, 1, 1), device=self.device)
 
     def sample_sigma(self, N):
-        return torch.stack([torch.randperm(self.d).reshape(self.h, self.w) + 1 for _ in range(N)])
+        return torch.stack([torch.randperm(self.d, device=self.device).reshape(self.h, self.w) + 1 for _ in range(N)])
 
     def training_step(self, batch, batch_idx):
         x, label = batch[0], batch[1]
@@ -97,7 +97,8 @@ class AODM(pl.LightningModule):
         pass
 
     def validation_epoch_end(self, outputs):
-        plot.samples = [self.sample_one()[:, :, 0] for _ in range(len(plot.samples_ax))]
+        if self.current_epoch % 10 == 0:
+            plot.samples = [self.sample_one()[:, :, 0].cpu() for _ in range(len(plot.samples_ax))]
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -105,7 +106,7 @@ class AODM(pl.LightningModule):
         return [opt], [sch]
 
     def sample_one(self):
-        x = torch.zeros(1, self.h, self.w, self.k)
+        x = torch.zeros(1, self.h, self.w, self.k, device=self.device)
         sigma = self.sample_sigma(1)
         for t in range(1, self.d + 1):
             mask, current = sigma < t, sigma == t
@@ -115,15 +116,11 @@ class AODM(pl.LightningModule):
         return x.squeeze()
 
     def sample_one_seeded(self, x_seed, mask):
-        x = torch.zeros(1, self.h, self.w, self.k)
+        x = torch.zeros(1, self.h, self.w, self.k, device=self.device)
         x[mask] = x_seed[mask]
-        # fig, ax = plt.subplots(2)
-        # ax[0].imshow(x[0, :, :, 0])
-        # ax[1].imshow(x_seed[0, :, :, 0])
-        # plt.show()
-        sigma = torch.zeros((1, self.h, self.w), dtype=torch.long)
+        sigma = torch.zeros((1, self.h, self.w), dtype=torch.long, device=self.device)
         sigma[mask] = torch.arange(mask.sum()) + 1
-        sigma[~mask] = torch.randperm(self.d - mask.sum()) + mask.sum()
+        sigma[~mask] = torch.randperm(self.d - mask.sum(), device=self.device) + mask.sum()
         for t in range(mask.sum(), self.d + 1):
             mask, current = sigma < t, sigma == t
             mask, current = mask.unsqueeze(-1).float(), current.unsqueeze(-1).float()
@@ -139,6 +136,7 @@ if __name__ == '__main__':
     parser = BinaryEMNISTDataModule.add_argparse_args(parser)
     parser.add_argument('--demo', default=None)
     parser.add_argument('--demo_seeded', default=None)
+    parser.add_argument('--resume', default=None)
     args = parser.parse_args()
 
     if args.demo is not None:
@@ -191,8 +189,9 @@ if __name__ == '__main__':
     else:
 
         seed_everything(1234)
-        dm = BinaryEMNISTDataModule(batch_size=8)
+        dm = BinaryEMNISTDataModule.from_argparse_args(args)
+
         model = AODM(28, 28, 2)
-        trainer = Trainer(enable_checkpointing=True,
-                          default_root_dir='.')
-        trainer.fit(model, datamodule=dm, ckpt_path="lightning_logs/version_38/checkpoints/epoch=324-step=1949999.ckpt")
+
+        trainer = Trainer.from_argparse_args(args)
+        trainer.fit(model, datamodule=dm, ckpt_path=args.resume)
