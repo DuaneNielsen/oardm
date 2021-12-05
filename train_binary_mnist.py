@@ -1,46 +1,145 @@
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-from torch.nn.functional import one_hot
 from torch.distributions import Categorical, OneHotCategorical
 from matplotlib import pyplot as plt
 from pl_bolts.datamodules.binary_emnist_datamodule import BinaryEMNISTDataModule
 from typing import Any, Callable, cast, Dict, Iterable, List, Optional, Tuple, Union
+import torchvision.utils
 from argparse import ArgumentParser, Namespace
 import torchmetrics
 import pytorch_lightning as pl
-from pytorch_lightning import LightningModule, Trainer, seed_everything
-from pytorch_lightning.utilities.argparse import from_argparse_args
 from pytorch_lightning.loggers import WandbLogger
 from pl_bolts.models.vision.unet import UNet
 from pytorch_lightning.plugins import DDPPlugin
 import wandb
 import numpy as np
+import metrics
+
+plt.ion()
 
 
-class Plot:
+class Plot(pl.Callback):
     def __init__(self):
+        super().__init__()
         self.r, self.c = 4, 4
         self.fig, self.ax = plt.subplots(self.r, self.c)
         self.training_ax = self.ax[0]
         self.training_images = []
         self.samples_ax = [ax for row in self.ax[1:] for ax in row]
         self.samples = []
-        self.fig.show()
-
-    def clear_ax(self):
-        for row in self.ax:
-            for a in row:
-                a.clear()
 
     def draw(self):
+
         for img, ax in zip(self.training_images, self.training_ax):
+            ax.clear()
             ax.imshow(img)
 
         for img, ax in zip(self.samples, self.samples_ax):
-            ax.imshow(img)
+            ax.clear()
+            ax.imshow(img[:, :, 0])
 
         self.fig.canvas.draw()
+
+    def on_train_batch_end(
+        self,
+        trainer: "pl.Trainer",
+        pl_module: "pl.LightningModule",
+        outputs,
+        batch: Any,
+        batch_idx: int,
+        unused: Optional[int] = 0,
+    ) -> None:
+        if pl_module.global_step % 1000 == 0:
+            loss, x, x_ = outputs['loss'], outputs['input'], outputs['generated']
+            self.training_images = [
+                x[0, :, :, 0].cpu(),
+                x_[0, :, :, 0].cpu(),
+                x[1, :, :, 0].cpu(),
+                x_[1, :, :, 0].cpu()
+            ]
+            self.draw()
+
+    def on_validation_batch_end(
+            self,
+            trainer: "pl.Trainer",
+            pl_module: "pl.LightningModule",
+            outputs,
+            batch: Any,
+            batch_idx: int,
+            dataloader_idx: int,
+    ) -> None:
+        self.samples.append(outputs['sample'])
+
+    def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        self.draw()
+        del self.samples
+        self.samples = []
+
+
+def make_grid(image_list):
+    """
+    image_list: list of 28, 28, 2 images
+    """
+    image_list = torch.stack(image_list)
+    image_list = image_list[:, :, :, 0]
+    image_list = image_list.unsqueeze(1)
+    image_grid = torchvision.utils.make_grid(image_list) * 255
+    return image_grid
+
+
+class WandbPlot(pl.Callback):
+    def __init__(self):
+        super().__init__()
+        self.training_images = []
+        self.samples = []
+
+    def on_train_batch_end(
+        self,
+        trainer: "pl.Trainer",
+        pl_module: "pl.LightningModule",
+        outputs,
+        batch: Any,
+        batch_idx: int,
+        unused: Optional[int] = 0,
+    ) -> None:
+        if pl_module.global_step % 1000 == 0:
+            loss, x, x_ = outputs['loss'], outputs['input'], outputs['generated']
+
+            training_input = make_grid([
+                x[0].cpu(),
+                x[1].cpu(),
+            ])
+
+            def exp_image(image):
+                return torch.exp(image + torch.finfo(image.dtype).eps)
+
+            training_output = make_grid([
+                exp_image(x_[0].cpu()),
+                exp_image(x_[1].cpu())
+            ])
+
+            panel = torch.cat((training_input, training_output), dim=1)
+
+            trainer.logger.experiment.log({
+                "train_panel": wandb.Image(panel),
+                })
+
+    def on_validation_batch_end(
+            self,
+            trainer: "pl.Trainer",
+            pl_module: "pl.LightningModule",
+            outputs,
+            batch: Any,
+            batch_idx: int,
+            dataloader_idx: int,
+    ) -> None:
+        self.samples.append(outputs['sample'])
+
+    def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        samples = make_grid(self.samples)
+        trainer.logger.experiment.log({"samples": wandb.Image(samples)})
+        del self.samples
+        self.samples = []
 
 
 class AODM(pl.LightningModule):
@@ -51,6 +150,7 @@ class AODM(pl.LightningModule):
         self.d = self.h * self.w
         self.fc = nn.Sequential(nn.Linear(h * w * k, 1024), nn.ELU(), nn.Linear(1024, h * w * k))
         self.lr = lr
+        self.sample_quality = metrics.BinaryMnistGenerationQuality()
 
     def forward(self, x):
         N, H, W, K = x.shape
@@ -80,22 +180,15 @@ class AODM(pl.LightningModule):
         return {'loss': -l.mean(), 'input': x.detach(), 'generated': x_.detach()}
 
     def training_step_end(self, o):
-        if self.global_step % 1000 == 0:
-            loss, x, x_ = o['loss'], o['input'], o['generated']
-            plot.clear_ax()
-            plot.training_images = [
-                x[0, :, :, 0].cpu(),
-                x_[0, :, :, 0].cpu(),
-                x[1, :, :, 0].cpu(),
-                x_[1, :, :, 0].cpu()
-            ]
-            plot.draw()
+        self.log('loss', o['loss'])
 
     def validation_step(self, *args, **kwargs) -> Optional:
-        pass
+        sample = self.sample_one()
+        self.sample_quality(sample)
+        return {'sample': sample.cpu()}
 
     def validation_epoch_end(self, outputs):
-        plot.samples = [self.sample_one()[:, :, 0].cpu() for _ in range(len(plot.samples_ax))]
+        self.log('sample_quality', self.sample_quality.compute())
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -128,10 +221,8 @@ class AODM(pl.LightningModule):
 
 if __name__ == '__main__':
 
-    plot = Plot()
-
     parser = ArgumentParser()
-    parser = Trainer.add_argparse_args(parser)
+    parser = pl.Trainer.add_argparse_args(parser)
     parser = BinaryEMNISTDataModule.add_argparse_args(parser)
     parser.add_argument('--demo', default=None)
     parser.add_argument('--demo_seeded', default=None)
@@ -187,12 +278,14 @@ if __name__ == '__main__':
 
     else:
 
-        seed_everything(1234)
+        wandb_logger = WandbLogger(project='oardm_binary_mnist')
+        pl.seed_everything(1234)
         dm = BinaryEMNISTDataModule.from_argparse_args(args)
 
         model = AODM(28, 28, 2)
 
-        trainer = Trainer.from_argparse_args(args,
+        trainer = pl.Trainer.from_argparse_args(args,
                                              strategy=DDPPlugin(find_unused_parameters=False),
-                                             check_val_every_n_epoch=30)
+                                             logger=wandb_logger,
+                                             callbacks=[Plot(), WandbPlot()])
         trainer.fit(model, datamodule=dm, ckpt_path=args.resume)
