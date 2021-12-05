@@ -13,6 +13,7 @@ from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.utilities.argparse import from_argparse_args
 from pytorch_lightning.loggers import WandbLogger
 from pl_bolts.models.vision.unet import UNet
+from pytorch_lightning.plugins import DDPPlugin
 import wandb
 import numpy as np
 
@@ -40,9 +41,6 @@ class Plot:
             ax.imshow(img)
 
         self.fig.canvas.draw()
-
-
-plot = Plot()
 
 
 class AODM(pl.LightningModule):
@@ -97,8 +95,7 @@ class AODM(pl.LightningModule):
         pass
 
     def validation_epoch_end(self, outputs):
-        if self.current_epoch % 10 == 0:
-            plot.samples = [self.sample_one()[:, :, 0].cpu() for _ in range(len(plot.samples_ax))]
+        plot.samples = [self.sample_one()[:, :, 0].cpu() for _ in range(len(plot.samples_ax))]
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -130,6 +127,8 @@ class AODM(pl.LightningModule):
 
 
 if __name__ == '__main__':
+
+    plot = Plot()
 
     parser = ArgumentParser()
     parser = Trainer.add_argparse_args(parser)
@@ -193,5 +192,7 @@ if __name__ == '__main__':
 
         model = AODM(28, 28, 2)
 
-        trainer = Trainer.from_argparse_args(args)
+        trainer = Trainer.from_argparse_args(args,
+                                             strategy=DDPPlugin(find_unused_parameters=False),
+                                             check_val_every_n_epoch=30)
         trainer.fit(model, datamodule=dm, ckpt_path=args.resume)
