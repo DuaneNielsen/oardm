@@ -37,7 +37,7 @@ class BinaryMnistGenerationQuality(torchmetrics.Metric):
     def update(self, sample: torch.Tensor):
 
         cls_probs = []
-        sample = sample.permute(2, 0, 1)
+        #sample = sample.permute(2, 0, 1)
         eps = torch.finfo(mu.dtype).eps
         for i in range(dm.num_classes):
             prob = sample[0] * self.mu[i] + (1 - sample[0]) * (1 - self.mu[i])

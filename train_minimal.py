@@ -39,7 +39,7 @@ def tensor_to_phrase(phrase):
     :return: a phrase of 6 words
     """
     index = torch.argmax(phrase, dim=1)
-    return [list(vocab)[i.item()] for i in index]
+    return [list(vocab)[i.ax()] for i in index]
 
 
 data = torch.stack([phrase_to_tensor(phrase) for phrase in phrases]).float()
@@ -119,5 +119,5 @@ if __name__ == '__main__':
         sample = addm.sample_one().detach()
         sample_ax.imshow(sample)
         fig.canvas.draw()
-        print(loss.item())
+        print(loss.ax())
         print(tensor_to_phrase(sample))

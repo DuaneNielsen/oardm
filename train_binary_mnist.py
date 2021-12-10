@@ -14,6 +14,7 @@ from pytorch_lightning.plugins import DDPPlugin
 import wandb
 import numpy as np
 import metrics
+from pathlib import Path
 
 plt.ion()
 
@@ -36,26 +37,26 @@ class Plot(pl.Callback):
 
         for img, ax in zip(self.samples, self.samples_ax):
             ax.clear()
-            ax.imshow(img[:, :, 0])
+            ax.imshow(img[0, :, :])
 
-        self.fig.canvas.draw()
+        plt.pause(0.05)
 
     def on_train_batch_end(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",
-        outputs,
-        batch: Any,
-        batch_idx: int,
-        unused: Optional[int] = 0,
+            self,
+            trainer: "pl.Trainer",
+            pl_module: "pl.LightningModule",
+            outputs,
+            batch: Any,
+            batch_idx: int,
+            unused: Optional[int] = 0,
     ) -> None:
         if pl_module.global_step % 1000 == 0:
             loss, x, x_ = outputs['loss'], outputs['input'], outputs['generated']
             self.training_images = [
-                x[0, :, :, 0].cpu(),
-                x_[0, :, :, 0].cpu(),
-                x[1, :, :, 0].cpu(),
-                x_[1, :, :, 0].cpu()
+                x[0, 0].cpu(),
+                x_[0, 0].cpu(),
+                x[1, 0].cpu(),
+                x_[1, 0].cpu()
             ]
             self.draw()
 
@@ -78,10 +79,10 @@ class Plot(pl.Callback):
 
 def make_grid(image_list):
     """
-    image_list: list of 28, 28, 2 images
+    image_list: list C, H, W of 2, 28, 28 images
     """
     image_list = torch.stack(image_list)
-    image_list = image_list[:, :, :, 0]
+    image_list = image_list[:, 0, :, :]
     image_list = image_list.unsqueeze(1)
     image_grid = torchvision.utils.make_grid(image_list) * 255
     return image_grid
@@ -94,13 +95,13 @@ class WandbPlot(pl.Callback):
         self.samples = []
 
     def on_train_batch_end(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",
-        outputs,
-        batch: Any,
-        batch_idx: int,
-        unused: Optional[int] = 0,
+            self,
+            trainer: "pl.Trainer",
+            pl_module: "pl.LightningModule",
+            outputs,
+            batch: Any,
+            batch_idx: int,
+            unused: Optional[int] = 0,
     ) -> None:
         if pl_module.global_step % 1000 == 0:
             loss, x, x_ = outputs['loss'], outputs['input'], outputs['generated']
@@ -122,7 +123,7 @@ class WandbPlot(pl.Callback):
 
             trainer.logger.experiment.log({
                 "train_panel": wandb.Image(panel),
-                })
+            })
 
     def on_validation_batch_end(
             self,
@@ -148,14 +149,13 @@ class AODM(pl.LightningModule):
         self.save_hyperparameters()
         self.h, self.w, self.k = h, w, k
         self.d = self.h * self.w
-        self.fc = nn.Sequential(nn.Linear(h * w * k, 1024), nn.ELU(), nn.Linear(1024, h * w * k))
+        self.unet = UNet(num_classes=2, input_channels=2)
         self.lr = lr
         self.sample_quality = metrics.BinaryMnistGenerationQuality()
 
     def forward(self, x):
-        N, H, W, K = x.shape
-        x = self.fc(x.flatten(start_dim=1)).reshape(N, H, W, K)
-        return torch.log_softmax(x, dim=3)
+        x_ = self.unet(x)
+        return torch.log_softmax(x_, dim=1)
 
     def sample_t(self, N):
         return torch.randint(1, self.d + 1, (N, 1, 1), device=self.device)
@@ -163,18 +163,24 @@ class AODM(pl.LightningModule):
     def sample_sigma(self, N):
         return torch.stack([torch.randperm(self.d, device=self.device).reshape(self.h, self.w) + 1 for _ in range(N)])
 
+    def sigma_with_mask(self, mask):
+        # sigma = [1.. mask_pixels || randperm (remaining pixels) ]
+        sigma = torch.zeros((1, self.h, self.w), dtype=torch.long, device=self.device)
+        sigma[mask] = torch.arange(mask.sum()) + 1
+        sigma[~mask] = torch.randperm(self.d - mask.sum(), device=self.device) + mask.sum()
+        return sigma
+
     def training_step(self, batch, batch_idx):
         x, label = batch[0], batch[1]
-        x = x.permute(0, 3, 2, 1)
-        x = torch.cat((x, (1. - x)), dim=3)
-        N, H, W, K = x.shape
+        x = torch.cat((x, (1. - x)), dim=1)
+        N, K, H, W = x.shape
         t = self.sample_t(N)
         sigma = self.sample_sigma(N)
         mask = sigma < t
-        mask = mask.unsqueeze(-1).float()
+        mask = mask.unsqueeze(1).float()
         x_ = self(x * mask)
-        C = Categorical(logits=x_)
-        l = (1. - mask) * C.log_prob(torch.argmax(x, dim=3)).unsqueeze(-1)
+        C = Categorical(logits=x_.permute(0, 2, 3, 1))
+        l = (1. - mask) * C.log_prob(torch.argmax(x, dim=1)).unsqueeze(1)
         n = 1. / (self.d - t + 1.)
         l = n * l.sum(dim=(1, 2, 3))
         return {'loss': -l.mean(), 'input': x.detach(), 'generated': x_.detach()}
@@ -192,34 +198,53 @@ class AODM(pl.LightningModule):
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=10)
-        return [opt], [sch]
+        return [opt]
 
     def sample_one(self):
-        x = torch.zeros(1, self.h, self.w, self.k, device=self.device)
+        x = torch.zeros(2, self.k, self.h, self.w, device=self.device)
         sigma = self.sample_sigma(1)
         for t in range(1, self.d + 1):
-            mask, current = sigma < t, sigma == t
-            mask, current = mask.unsqueeze(-1).float(), current.unsqueeze(-1).float()
-            x_ = OneHotCategorical(logits=self((x * mask))).sample()
-            x = x * (1 - current) + x_ * current
+            x = self.sample_step(x, t, sigma)
         return x.squeeze()
 
     def sample_one_seeded(self, x_seed, mask):
-        x = torch.zeros(1, self.h, self.w, self.k, device=self.device)
+
+        # add masked pixels to seed
+        x = torch.zeros(1, self.k, self.h, self.w, device=self.device)
         x[mask] = x_seed[mask]
-        sigma = torch.zeros((1, self.h, self.w), dtype=torch.long, device=self.device)
-        sigma[mask] = torch.arange(mask.sum()) + 1
-        sigma[~mask] = torch.randperm(self.d - mask.sum(), device=self.device) + mask.sum()
+        sigma = self.sigma_with_mask(mask)
+
         for t in range(mask.sum(), self.d + 1):
-            mask, current = sigma < t, sigma == t
-            mask, current = mask.unsqueeze(-1).float(), current.unsqueeze(-1).float()
-            x_ = OneHotCategorical(logits=self((x * mask))).sample()
-            x = x * (1 - current) + x_ * current
-        return x.squeeze()
+            x = self.sample_step(x, t, sigma)
+        return x
+
+    def sample_step(self, x, t, sigma):
+        """
+        Performs one step of the noise reversal transition function in order sigma at time t
+        x: the current state
+        t: the current timestep
+        sigma: the order
+        """
+        past, current = sigma < t, sigma == t
+        past, current = past.unsqueeze(1).float(), current.unsqueeze(1).float()
+        logprobs = self((x * past))
+        x_ = OneHotCategorical(logits=logprobs.permute(0, 2, 3, 1)).sample().permute(0, 3, 1, 2)
+        x = x * (1 - current) + x_ * current
+        return x
+
+
+def load_from_wandb_checkpoint(model_id_and_version):
+    checkpoint_reference = f"duanenielsen/{project}/{model_id_and_version}"
+    # download checkpoint locally (if not already cached)
+    run = wandb.init(project=project)
+    artifact = run.use_artifact(checkpoint_reference, type="model")
+    artifact_dir = artifact.download()
+    return AODM.load_from_checkpoint(Path(artifact_dir) / "model.ckpt")
 
 
 if __name__ == '__main__':
+
+    project = 'oardm_binary_mnist'
 
     parser = ArgumentParser()
     parser = pl.Trainer.add_argparse_args(parser)
@@ -229,63 +254,98 @@ if __name__ == '__main__':
     parser.add_argument('--resume', default=None)
     args = parser.parse_args()
 
-    if args.demo is not None:
-        fig = plt.figure()
-        ax = fig.subplots(1)
-        fig.canvas.draw()
-        plt.pause(0.05)
+    wandb_logger = WandbLogger(project=project, log_model='all')
 
-        model = AODM.load_from_checkpoint(args.demo, h=28, w=28, k=2)
+    if args.demo is not None:
+
+        model = load_from_wandb_checkpoint(args.demo)
+        fig = plt.figure()
+        spec = fig.add_gridspec(4, 4)
+        sample_ax = fig.add_subplot(spec[0:3, :])
+        progress_ax = fig.add_subplot(spec[3, :])
 
         while True:
-            x = torch.zeros(1, model.h, model.w, model.k)
+            x = torch.zeros(2, model.k, model.h, model.w, device=model.device)
             sigma = model.sample_sigma(1)
+
+            sample_ax.clear()
+            sample_ax.imshow(x[0, 0])
+            progress_ax.clear()
+            plt.pause(0.01)
+
             for t in range(1, model.d + 1):
-                mask, current = sigma < t, sigma == t
-                mask, current = mask.unsqueeze(-1).float(), current.unsqueeze(-1).float()
-                x_ = OneHotCategorical(logits=model((x * mask))).sample()
-                x = x * (1 - current) + x_ * current
-                if t % 10 == 0:
-                    ax.clear()
-                    ax.imshow(x[0, :, :, 0])
-                    fig.canvas.draw()
-            plt.pause(3.0)
+                x = model.sample_step(x, t, sigma)
+                if t % 100 == 0:
+                    sample_ax.clear()
+                    sample_ax.imshow(x[0, 0], origin='lower')
+                if t % 20 == 0:
+                    progress_ax.clear()
+                    progress_ax.barh(1, t)
+                    progress_ax.set_xlim((0, model.d))
+                    plt.pause(0.01)
+            sample_ax.clear()
+            sample_ax.imshow(x[0, 0])
+            plt.pause(5.00)
 
     elif args.demo_seeded is not None:
-        fig = plt.figure()
-        ax_sample, ax_seed, ax_mask = fig.subplots(3)
-        fig.canvas.draw()
-        plt.pause(0.05)
 
-        model = AODM.load_from_checkpoint(args.demo_seeded, h=28, w=28, k=2)
+        model = load_from_wandb_checkpoint(args.demo_seeded)
+        fig = plt.figure()
+        spec = fig.add_gridspec(4, 4)
+        sample_ax = fig.add_subplot(spec[0:3, :])
+        progress_ax = fig.add_subplot(spec[3, :])
 
         while True:
             dm = BinaryEMNISTDataModule(batch_size=1)
             dm.setup('test')
             ds = dm.test_dataloader()
             for batch in ds:
+                # sample an image from batch
                 x_seed, label = batch[0], batch[1]
-                x_seed = x_seed.permute(0, 3, 2, 1)
-                x_seed = torch.cat((x_seed, (1. - x_seed)), dim=3)
-                mask = torch.zeros(x_seed.shape[:-1], dtype=torch.bool)
-                mask[0, model.h // 2:, :] = True
-                x = model.sample_one_seeded(x_seed, mask)
-                ax_sample.clear(), ax_seed.clear(), ax_mask.clear()
-                ax_sample.imshow(x[:, :, 0])
-                ax_seed.imshow(x_seed[0, :, :, 0])
-                ax_mask.imshow(mask[0, :, :])
-                plt.pause(3.0)
+                x_seed = torch.cat((x_seed, (1. - x_seed)), dim=1)
+
+                # mask the bit we want to seed with
+                mask = torch.zeros(model.h, model.w, dtype=torch.bool).squeeze(1)
+                mask[model.h // 2:, :] = True
+                mask = mask.reshape(model.h, model.w)
+
+                # push the seed to the initial state, and
+                x = torch.zeros(2, model.k, model.h, model.w, device=model.device)
+                x[:, :, mask] = x_seed[:, :, mask]
+
+                # construct a sigma that puts masked pixels at the start of sequence
+                sigma = model.sigma_with_mask(mask.unsqueeze(0))
+
+                # t starts at the non-mask pixels
+                for t in range(mask.sum(), model.d + 1):
+                    x = model.sample_step(x, t, sigma)
+
+                    if t % 100 == 0:
+                        sample_ax.clear()
+                        sample_ax.imshow(x[0, 0])
+                    if t % 20 == 0:
+                        progress_ax.clear()
+                        progress_ax.barh(1, t)
+                        progress_ax.set_xlim((0, model.d))
+                        plt.pause(0.01)
+                sample_ax.clear()
+                sample_ax.imshow(x[0, 0])
+                plt.pause(5.00)
 
     else:
 
-        wandb_logger = WandbLogger(project='oardm_binary_mnist')
         pl.seed_everything(1234)
         dm = BinaryEMNISTDataModule.from_argparse_args(args)
+        checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=100)
 
-        model = AODM(28, 28, 2)
+        if args.resume is not None:
+            model = load_from_wandb_checkpoint(args.resume)
+        else:
+            model = AODM(28, 28, 2)
 
         trainer = pl.Trainer.from_argparse_args(args,
-                                             strategy=DDPPlugin(find_unused_parameters=False),
-                                             logger=wandb_logger,
-                                             callbacks=[Plot(), WandbPlot()])
-        trainer.fit(model, datamodule=dm, ckpt_path=args.resume)
+                                                strategy=DDPPlugin(find_unused_parameters=False),
+                                                logger=wandb_logger,
+                                                callbacks=[Plot(), WandbPlot(), checkpoint_callback])
+
+        trainer.fit(model, datamodule=dm)
