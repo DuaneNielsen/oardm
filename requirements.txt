@@ -1,2 +1,7 @@
 torch
+torchvision
+pytorch-lightning
+lightning-bolts
 matplotlib
+torchmetrics[image]
+wandb
