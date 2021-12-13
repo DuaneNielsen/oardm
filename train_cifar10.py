@@ -128,7 +128,7 @@ class WandbPlot(pl.Callback):
             batch_idx: int,
             dataloader_idx: int,
     ) -> None:
-        self.samples += [s for s in outputs['sample']]
+        self.samples += [s.clamp(0., 1.) for s in outputs['sample']]
 
     def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         samples = make_grid(self.samples)
@@ -269,6 +269,7 @@ if __name__ == '__main__':
     parser.add_argument('--resume', default=None)
     args = parser.parse_args()
 
+    wandb.finish()
     wandb_logger = WandbLogger(project=project, log_model='all')
 
     if args.demo is not None:
