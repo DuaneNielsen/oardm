@@ -1,22 +1,10 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributions as dst
 from torch.optim import Adam
 from matplotlib import pyplot as plt
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import ToTensor
-
-
-def mix_logistic_dist(pi, loc, scale):
-    pi, loc, scale = torch.log_softmax(pi, -1), loc, F.softplus(scale)
-    pi_dist = dst.Categorical(logits=pi)
-    logistic_dist =  dst.TransformedDistribution(
-        base_distribution=dst.Uniform(0., 1.),
-        transforms=[dst.SigmoidTransform().inv,
-                    dst.AffineTransform(loc=loc, scale=scale)]
-    )
-    return dst.MixtureSameFamily(pi_dist, logistic_dist)
 
 
 fig, axes = plt.subplots(1, 2)
@@ -25,6 +13,17 @@ img_x, img_y = axes
 ds = CIFAR10(root='~/data', transform=ToTensor())
 img, label = ds[70]
 img_x.imshow((img.permute(1, 2, 0)))
+
+
+def mix_logistic_dist(pi, loc, scale):
+    pi, loc, scale = torch.log_softmax(pi, -1), loc, F.softplus(scale)
+    pi_dist = dst.Categorical(logits=pi)
+    logistic_dist = dst.TransformedDistribution(
+        base_distribution=dst.Uniform(0., 1.),
+        transforms=[dst.SigmoidTransform().inv,
+                    dst.AffineTransform(loc=loc, scale=scale)]
+    )
+    return dst.MixtureSameFamily(pi_dist, logistic_dist)
 
 
 class ImageGen(nn.Module):
