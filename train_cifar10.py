@@ -2,7 +2,7 @@ import torch
 from matplotlib import pyplot as plt
 from pl_bolts.datamodules import CIFAR10DataModule
 from typing import Any, Optional
-import torchvision.utils
+from torchvision.utils import make_grid
 from argparse import ArgumentParser
 from torchmetrics.image.fid import FID
 import pytorch_lightning as pl
@@ -75,11 +75,6 @@ class Plot(pl.Callback):
         self.samples = []
 
 
-def make_grid(image_list):
-    image_grid = torchvision.utils.make_grid(torch.stack(image_list))
-    return image_grid
-
-
 class WandbPlot(pl.Callback):
     def __init__(self):
         super().__init__()
@@ -97,27 +92,13 @@ class WandbPlot(pl.Callback):
     ) -> None:
         if pl_module.global_step % 1000 == 0:
             loss, x, x_m, x_ = outputs['loss'], outputs['input'], outputs['masked_input'], outputs['generated']
+            N = x.shape[0]
 
-            training_input = make_grid([
-                x[0].cpu().clamp(0, 1),
-                x[1].cpu().clamp(0, 1)
-            ])
-
-            masked_input = make_grid([
-                x_m[0].cpu().clamp(0, 1),
-                x_m[1].cpu().clamp(0, 1)
-            ])
-
-            training_output = make_grid([
-                x_[0].cpu().clamp(0, 1),
-                x_[1].cpu().clamp(0, 1)
-            ])
-
+            training_input = make_grid(x.cpu().clamp(0, 1), nrow=N)
+            masked_input = make_grid(x_m.cpu().clamp(0, 1), nrow=N)
+            training_output = make_grid(x_.cpu().clamp(0, 1), nrow=N)
             panel = torch.cat((training_input, masked_input, training_output), dim=1)
-
-            trainer.logger.experiment.log({
-                "train_panel": wandb.Image(panel),
-            })
+            trainer.logger.experiment.log({"train_panel": wandb.Image(panel)})
 
     def on_validation_batch_end(
             self,
@@ -267,6 +248,7 @@ if __name__ == '__main__':
     parser.add_argument('--demo', default=None)
     parser.add_argument('--demo_seeded', default=None)
     parser.add_argument('--resume', default=None)
+    parser.add_argument('--matplotlib', action='store_true', default=False)
     args = parser.parse_args()
 
     wandb.finish()
@@ -354,6 +336,11 @@ if __name__ == '__main__':
         dm = CIFAR10DataModule.from_argparse_args(args)
         checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=100)
 
+        callbacks = [WandbPlot(), checkpoint_callback]
+
+        if args.matplotlib:
+            callbacks.append(Plot())
+
         if args.resume is not None:
             model = load_from_wandb_checkpoint(args.resume)
         else:
@@ -362,6 +349,6 @@ if __name__ == '__main__':
         trainer = pl.Trainer.from_argparse_args(args,
                                                 strategy=DDPPlugin(find_unused_parameters=False),
                                                 logger=wandb_logger,
-                                                callbacks=[Plot(), WandbPlot(), checkpoint_callback])
+                                                callbacks=callbacks)
 
         trainer.fit(model, datamodule=dm)
