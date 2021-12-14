@@ -81,6 +81,14 @@ class WandbPlot(pl.Callback):
         self.training_images = []
         self.samples = []
 
+    def make_step_panel(self, x, x_m, x_):
+        N = x.shape[0]
+        training_input = make_grid(x.cpu().clamp(0, 1), nrow=N)
+        masked_input = make_grid(x_m.cpu().clamp(0, 1), nrow=N)
+        training_output = make_grid(x_.cpu().clamp(0, 1), nrow=N)
+        panel = torch.cat((training_input, masked_input, training_output), dim=1)
+        return panel
+
     def on_train_batch_end(
             self,
             trainer: "pl.Trainer",
@@ -92,12 +100,7 @@ class WandbPlot(pl.Callback):
     ) -> None:
         if pl_module.global_step % 1000 == 0:
             loss, x, x_m, x_ = outputs['loss'], outputs['input'], outputs['masked_input'], outputs['generated']
-            N = x.shape[0]
-
-            training_input = make_grid(x.cpu().clamp(0, 1), nrow=N)
-            masked_input = make_grid(x_m.cpu().clamp(0, 1), nrow=N)
-            training_output = make_grid(x_.cpu().clamp(0, 1), nrow=N)
-            panel = torch.cat((training_input, masked_input, training_output), dim=1)
+            panel = self.make_step_panel(x, x_m, x_)
             trainer.logger.experiment.log({"train_panel": wandb.Image(panel)})
 
     def on_validation_batch_end(
@@ -109,6 +112,9 @@ class WandbPlot(pl.Callback):
             batch_idx: int,
             dataloader_idx: int,
     ) -> None:
+        loss, x, x_m, x_ = outputs['loss'], outputs['input'], outputs['masked_input'], outputs['generated']
+        panel = self.make_step_panel(x, x_m, x_)
+        trainer.logger.experiment.log({"val_panel": wandb.Image(panel)})
         self.samples += [s.clamp(0., 1.) for s in outputs['sample']]
 
     def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
@@ -119,7 +125,8 @@ class WandbPlot(pl.Callback):
 
 
 def mix_logistic_dist(pi, loc, scale):
-    pi, loc, scale = torch.log_softmax(pi, -1), loc, F.softplus(scale)
+    eps = torch.finfo(scale.dtype).eps
+    pi, loc, scale = torch.log_softmax(pi + eps, -1), loc, F.softplus(scale) + eps
     pi_dist = dst.Categorical(logits=pi)
     logistic_dist = dst.TransformedDistribution(
         base_distribution=dst.Uniform(low=torch.zeros(loc.shape, device=loc.device),
@@ -160,9 +167,8 @@ class AODM(pl.LightningModule):
         sigma[~mask] = torch.randperm(self.d - mask.sum(), device=self.device) + mask.sum()
         return sigma
 
-    def training_step(self, batch, batch_idx):
-        x, label = batch[0], batch[1]
-        N, C, H, W = x.shape
+    def _step(self, x):
+        N = x.shape[0]
         t = self.sample_t(N)
         sigma = self.sample_sigma(N)
         mask = sigma < t
@@ -170,8 +176,13 @@ class AODM(pl.LightningModule):
         x_dist, x_ = self(masked_x)
         l = ~mask * x_dist.log_prob(x)
         n = 1. / (self.d - t + 1.)
-        l = n * l.sum(dim=(1, 2, 3), keepdims=True)
-        return {'loss': -l.mean(), 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
+        ln = n * l.sum(dim=(1, 2, 3), keepdims=True)
+        return ln, mask, masked_x, x_
+
+    def training_step(self, batch, batch_idx):
+        x, label = batch[0], batch[1]
+        ln, mask, masked_x, x_ = self._step(x)
+        return {'loss': -ln.mean(), 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
 
     def training_step_end(self, o):
         self.log('loss', o['loss'])
@@ -179,7 +190,9 @@ class AODM(pl.LightningModule):
     def validation_step(self, batch, batch_idx) -> Optional:
         with torch.no_grad():
             x, label = batch[0], batch[1]
-            N, C, H, W = x.shape
+            ln, mask, masked_x, x_ = self._step(x)
+
+            N = x.shape[0]
             sample = self.sample(N)
 
             def to_uint8(img):
@@ -187,13 +200,16 @@ class AODM(pl.LightningModule):
 
             self.fid.update(to_uint8(x), real=True)
             self.fid.update(to_uint8(sample), real=False)
-            return {'sample': sample.cpu()}
+            return {'loss': -ln.mean(), 'sample': sample.cpu(), 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
+
+    def validation_step_end(self, o):
+        self.log('val_loss', o['loss'])
 
     def validation_epoch_end(self, outputs):
         self.log('FID', self.fid.compute())
 
     def configure_optimizers(self):
-        opt = torch.optim.Adam(self.unet.parameters(), lr=self.lr)
+        opt = torch.optim.Adam(self.unet.parameters(), lr=self.lr, weight_decay=0.)
         return [opt]
 
     def sample(self, N):
