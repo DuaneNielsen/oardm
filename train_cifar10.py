@@ -13,6 +13,7 @@ import wandb
 from pathlib import Path
 import torch.distributions as dst
 import torch.nn.functional as F
+from distributions import discretized_mix_logistic_loss, sample_from_discretized_mix_logistic
 
 
 class Plot(pl.Callback):
@@ -126,7 +127,7 @@ class WandbPlot(pl.Callback):
 
 def mix_logistic_dist(pi, loc, scale):
     eps = torch.finfo(scale.dtype).eps
-    pi, loc, scale = torch.log_softmax(pi + eps, -1), loc, F.softplus(scale) + eps
+    pi, loc, scale = torch.log_softmax(pi + eps, -1), torch.sigmoid(loc * 100.) / 100., F.softplus(scale) + eps
     pi_dist = dst.Categorical(logits=pi)
     logistic_dist = dst.TransformedDistribution(
         base_distribution=dst.Uniform(low=torch.zeros(loc.shape, device=loc.device),
@@ -139,26 +140,23 @@ def mix_logistic_dist(pi, loc, scale):
 
 
 class AODM(pl.LightningModule):
-    def __init__(self, c, h, w, num_mix, lr=1e-4):
+    def __init__(self, h, w, num_mix, lr=1e-4):
         super().__init__()
         self.save_hyperparameters()
-        self.c, self.h, self.w, self.num_mix = c, h, w, num_mix
-        self.d = self.c * self.h * self.w
-        self.unet = UNet(num_classes=self.c * 3 * num_mix, input_channels=3)
+        self.c, self.h, self.w, self.num_mix = 3, h, w, num_mix
+        self.d = self.h * self.w
+        self.unet = UNet(num_classes=10 * num_mix, input_channels=3)
         self.lr = lr
         self.fid = FID()
 
     def forward(self, x):
-        N = x.shape[0]
-        x_ = self.unet(x).reshape(N, self.c, self.h, self.w, self.num_mix * 3)
-        pi, loc, scale = x_.chunk(3, dim=-1)
-        return mix_logistic_dist(pi, loc, scale)
+        return self.unet(x)
 
     def sample_t(self, N):
         return torch.randint(1, self.d + 1, (N, 1, 1, 1), device=self.device)
 
     def sample_sigma(self, N):
-        return torch.stack([torch.randperm(self.d, device=self.device).reshape(self.c, self.h, self.w) + 1 for _ in range(N)])
+        return torch.stack([torch.randperm(self.d, device=self.device).reshape(1, self.h, self.w) + 1 for _ in range(N)])
 
     def sigma_with_mask(self, mask):
         # sigma = [1.. mask_pixels || randperm (remaining pixels) ]
@@ -169,14 +167,16 @@ class AODM(pl.LightningModule):
 
     def _step(self, x):
         N = x.shape[0]
+        x = x * 2 - 1.  # rescale from 0 .. 1 to -1 .. 1
         t = self.sample_t(N)
         sigma = self.sample_sigma(N)
         mask = sigma < t
         masked_x = x * mask
-        x_dist, x_ = self(masked_x)
-        l = ~mask * x_dist.log_prob(x)
+        dist_params = self(masked_x)
+        log_prob, x_ = discretized_mix_logistic_loss(x, dist_params)
+        l = ~mask.squeeze() * log_prob
         n = 1. / (self.d - t + 1.)
-        ln = n * l.sum(dim=(1, 2, 3), keepdims=True)
+        ln = n * l.sum(dim=(1, 2), keepdims=True)
         return ln, mask, masked_x, x_
 
     def training_step(self, batch, batch_idx):
@@ -222,7 +222,7 @@ class AODM(pl.LightningModule):
     def sample_one_seeded(self, x_seed, mask):
 
         # add masked pixels to seed
-        x = torch.zeros(1, self.k, self.h, self.w, device=self.device)
+        x = torch.zeros(1, self.c, self.h, self.w, device=self.device)
         x[mask] = x_seed[mask]
         sigma = self.sigma_with_mask(mask)
 
@@ -239,8 +239,8 @@ class AODM(pl.LightningModule):
         """
         with torch.no_grad():
             past, current = sigma < t, sigma == t
-            dist, mean = self((x * past))
-            x_ = dist.sample()
+            params = self((x * past))
+            x_ = sample_from_discretized_mix_logistic(params)
             x = x * ~current + x_ * current
             return x
 
@@ -360,7 +360,7 @@ if __name__ == '__main__':
         if args.resume is not None:
             model = load_from_wandb_checkpoint(args.resume)
         else:
-            model = AODM(c=3, h=32, w=32, num_mix=10)
+            model = AODM(h=32, w=32, num_mix=10)
 
         trainer = pl.Trainer.from_argparse_args(args,
                                                 strategy=DDPPlugin(find_unused_parameters=False),
