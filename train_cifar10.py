@@ -13,7 +13,11 @@ import wandb
 from pathlib import Path
 import torch.distributions as dst
 import torch.nn.functional as F
-from distributions import discretized_mix_logistic_loss, sample_from_discretized_mix_logistic
+from distribution_utils import discretized_mix_logistic_rgb as disc_mix_logistic_rgb
+from distribution_utils import sample_from_discretized_mix_logistic_rgb as sample_disc_mix_logistic_rgb
+
+
+rescale_color = lambda x: (x + 1.) / 2.
 
 
 class Plot(pl.Callback):
@@ -49,6 +53,7 @@ class Plot(pl.Callback):
     ) -> None:
         if pl_module.global_step % 1000 == 0:
             loss, x, x_m, x_ = outputs['loss'], outputs['input'], outputs['masked_input'], outputs['generated']
+            x, x_m, x_ = rescale_color(x), rescale_color(x_m), rescale_color(x_)
             self.training_images = [
                 x[0].cpu(),
                 x_m[0].cpu(),
@@ -68,7 +73,7 @@ class Plot(pl.Callback):
             batch_idx: int,
             dataloader_idx: int,
     ) -> None:
-        self.samples += [s for s in outputs['sample']]
+        self.samples += [rescale_color(s) for s in outputs['sample']]
 
     def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         self.draw()
@@ -84,6 +89,7 @@ class WandbPlot(pl.Callback):
 
     def make_step_panel(self, x, x_m, x_):
         N = x.shape[0]
+        x, x_m, x_ = rescale_color(x), rescale_color(x_m), rescale_color(x_)
         training_input = make_grid(x.cpu().clamp(0, 1), nrow=N)
         masked_input = make_grid(x_m.cpu().clamp(0, 1), nrow=N)
         training_output = make_grid(x_.cpu().clamp(0, 1), nrow=N)
@@ -116,7 +122,7 @@ class WandbPlot(pl.Callback):
         loss, x, x_m, x_ = outputs['loss'], outputs['input'], outputs['masked_input'], outputs['generated']
         panel = self.make_step_panel(x, x_m, x_)
         trainer.logger.experiment.log({"val_panel": wandb.Image(panel)})
-        self.samples += [s.clamp(0., 1.) for s in outputs['sample']]
+        self.samples += [rescale_color(s).clamp(0., 1.) for s in outputs['sample']]
 
     def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         samples = make_grid(self.samples)
@@ -144,6 +150,7 @@ class AODM(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.c, self.h, self.w, self.num_mix = 3, h, w, num_mix
+        self.gridsize = 1. / (256 - 1.)
         self.d = self.h * self.w
         self.unet = UNet(num_classes=10 * num_mix, input_channels=3)
         self.lr = lr
@@ -167,13 +174,12 @@ class AODM(pl.LightningModule):
 
     def _step(self, x):
         N = x.shape[0]
-        x = x * 2 - 1.  # rescale from 0 .. 1 to -1 .. 1
         t = self.sample_t(N)
         sigma = self.sample_sigma(N)
         mask = sigma < t
         masked_x = x * mask
         dist_params = self(masked_x)
-        log_prob, x_ = discretized_mix_logistic_loss(x, dist_params)
+        log_prob, x_ = disc_mix_logistic_rgb(x, dist_params, self.gridsize)
         l = ~mask.squeeze() * log_prob
         n = 1. / (self.d - t + 1.)
         ln = n * l.sum(dim=(1, 2), keepdims=True)
@@ -181,6 +187,7 @@ class AODM(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, label = batch[0], batch[1]
+        x = x * 2 - 1.  # rescale from 0 .. 1 to -1 .. 1
         ln, mask, masked_x, x_ = self._step(x)
         return {'loss': -ln.mean(), 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
 
@@ -190,13 +197,13 @@ class AODM(pl.LightningModule):
     def validation_step(self, batch, batch_idx) -> Optional:
         with torch.no_grad():
             x, label = batch[0], batch[1]
+            x = x * 2 - 1.  # rescale from 0 .. 1 to -1 .. 1
             ln, mask, masked_x, x_ = self._step(x)
-
             N = x.shape[0]
             sample = self.sample(N)
 
             def to_uint8(img):
-                return (img.clamp(0., 1.) * 255).to(dtype=torch.uint8)
+                return ((img.clamp(-1., 1.) + 1) * 255 / 2).to(dtype=torch.uint8)
 
             self.fid.update(to_uint8(x), real=True)
             self.fid.update(to_uint8(sample), real=False)
@@ -240,7 +247,9 @@ class AODM(pl.LightningModule):
         with torch.no_grad():
             past, current = sigma < t, sigma == t
             params = self((x * past))
-            x_ = sample_from_discretized_mix_logistic(params)
+            seed = torch.randint(low=0, high=torch.iinfo(torch.int32).max, size=(1, ), dtype=torch.int32)
+            num_mix = torch.tensor([self.num_mix], dtype=torch.int32)
+            x_ = sample_disc_mix_logistic_rgb(params)
             x = x * ~current + x_ * current
             return x
 
