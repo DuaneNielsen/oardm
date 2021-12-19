@@ -152,7 +152,7 @@ class AODM(pl.LightningModule):
         self.c, self.h, self.w, self.num_mix = 3, h, w, num_mix
         self.gridsize = 1. / (256 - 1.)
         self.d = self.h * self.w
-        self.unet = UNet(num_classes=10 * num_mix, input_channels=3)
+        self.unet = UNet(num_classes=10 * num_mix, input_channels=3, features_start=128)
         self.lr = lr
         self.fid = FID()
 
@@ -369,11 +369,12 @@ if __name__ == '__main__':
         if args.resume is not None:
             model = load_from_wandb_checkpoint(args.resume)
         else:
-            model = AODM(h=32, w=32, num_mix=10)
+            model = AODM(h=32, w=32, num_mix=30)
 
         trainer = pl.Trainer.from_argparse_args(args,
                                                 strategy=DDPPlugin(find_unused_parameters=False),
                                                 logger=wandb_logger,
-                                                callbacks=callbacks)
+                                                callbacks=callbacks,
+                                                gradient_clip_val=100.)
 
         trainer.fit(model, datamodule=dm)

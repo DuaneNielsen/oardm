@@ -18,9 +18,17 @@ def condition_rgb_means(x, means, coeffs):
     r, g, b = x.chunk(3, dim=3)
     mr, mg, mb = means.chunk(3, dim=3)
     c1, c2, c3 = coeffs.chunk(3, dim=3)
+
+    # compute means with respect to means only for visualization purposes
+    with torch.no_grad():
+        mmg = mg + c1 * mr
+        mmb = mb + c2 * mr + c3 * mg
+
+    # means with respect to input image
     mg = mg + c1 * r
     mb = mb + c2 * r + c3 * g
-    return torch.cat([mr, mg, mb], dim=3)
+
+    return torch.cat([mr, mg, mb], dim=3), torch.cat([mr.detach(), mmg, mmb], dim=3)
 
 
 def discretize(x, means, scale, gridsize):
@@ -69,7 +77,7 @@ def discretized_mix_logistic_rgb(x, params, gridsize):
     x = x.reshape(*x.shape, 1)
     x = x.repeat_interleave(nr_mix, dim=-1)
 
-    means = condition_rgb_means(x, means, coeffs)
+    means, dist_means = condition_rgb_means(x, means, coeffs)
 
     log_cdf_plus, log_one_minus_cdf_min, cdf_delta = discretize(x, means, scales, gridsize)
     log_probs = redistribute_tails(x, log_cdf_plus, log_one_minus_cdf_min, cdf_delta)
@@ -85,28 +93,48 @@ def discretized_mix_logistic_rgb(x, params, gridsize):
 
     assert log_probs.shape == (N, H, W)
 
-    return log_probs, torch.sum(pi_logits.unsqueeze(-2).exp() * means, dim=-1).permute(0, 3, 1, 2)
+    return log_probs, torch.sum(pi_logits.unsqueeze(-2).exp() * dist_means, dim=-1).permute(0, 3, 1, 2)
+
+
+def select_logistic(selection, means, log_scales, coeffs):
+    means = torch.sum(means * selection, dim=4)
+    log_scales = torch.sum(log_scales * selection, dim=4)
+    coeffs = torch.sum(coeffs * selection, dim=4)
+    return means, log_scales, coeffs
+
+
+def standard_logistic(u, means, log_scales):
+    standard_logistic = torch.log(u) - torch.log(1. - u)
+    scale = 1. / softplus(log_scales)
+    x = means + scale * standard_logistic
+    return x
+
+
+def color_subpixels(x, coeffs):
+    x0, x1, x2 = x.chunk(3, dim=3)
+    c0, c1, c2 = coeffs.chunk(3, dim=3)
+
+    x0 = x0.clamp(min=-1, max=1.)
+    x1 = x1 + c0 * x0
+    x1 = x1.clamp(min=-1, max=1.)
+    x2 = x2 + c1 * x0 + c2 * x1
+    x2 = x2.clamp(min=-1, max=1.)
+
+    return torch.cat([x0, x1, x2], dim=3)
 
 
 def sample_from_discretized_mix_logistic_rgb(params):
     params = params.permute(0, 2, 3, 1)
     nr_mix = params.shape[3] // 10
     pi_logits, means, log_scales, coeffs = unpack_params(params, nr_mix)
+    coeffs = torch.tanh(coeffs)
 
     selection = OneHotCategorical(logits=pi_logits).sample().unsqueeze(-2)
-    means = torch.sum(means * selection, dim=4)
-    log_scales = torch.sum(log_scales * selection, dim=4)
-    coeffs = torch.sum(coeffs * selection, dim=4)
+    means, log_scales, coeffs = select_logistic(selection, means, log_scales, coeffs)
 
     u = torch.rand(means.shape, device=params.device).clamp(min=1e-5, max=1. - 1e-5)
 
-    standard_logistic = torch.log(u) - torch.log(1. - u)
-    scale = 1. / softplus(log_scales)
-    x = means + scale * standard_logistic
+    x = standard_logistic(u, means, log_scales)
+    sample_x = color_subpixels(x, coeffs)
 
-    x0, x1, x2 = x.chunk(3, dim=3)
-    c0, c1, c2 = coeffs.chunk(3, dim=3)
-    x1 = x1 + c0 * x0
-    x2 = x2 + c1 * x0 + c2 * x1
-    sample_x = torch.cat([x0, x1, x2], dim=3).clamp(min=-1., max=1.)
     return sample_x.permute(0, 3, 1, 2)

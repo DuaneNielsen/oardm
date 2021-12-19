@@ -1,5 +1,4 @@
 import torch
-import distributions_old as d
 import jax.numpy as jnp
 import jax
 import numpy as np
@@ -7,23 +6,6 @@ from jax2torch import jax2torch
 from distribution_utils_jax import discretized_mix_logistic_rgb, sample_from_discretized_mix_logistic_rgb
 import distribution_utils_jax as dujax
 import distribution_utils as du
-
-
-def test_logprob():
-    params = torch.ones((2, 30, 4, 5))
-    x = torch.ones((2, 3, 4, 5))
-    x = x * 2. - 1.
-
-    logprob, means = d.discretized_mix_logistic_loss(x, params)
-
-    x = jnp.ones((2, 4, 5, 3))
-    x = x * 2. - 1.
-    params = jnp.ones((2, 4, 5, 30))
-    gridsize = 1. / (256 - 1.)
-
-    log_probs = discretized_mix_logistic_rgb(x, params, gridsize)
-
-    assert (np.allclose(logprob.numpy(), log_probs, atol=1e-4))
 
 
 def test_logprob_wrapped():
@@ -43,22 +25,6 @@ def test_logprob_wrapped():
     log_probs = discretized_mix_logistic_rgb(x, params, gridsize)
 
     assert (np.allclose(torch_log_probs.numpy(), log_probs, atol=1e-4))
-
-
-def test_sample():
-    params = torch.ones(2, 30, 4, 5)
-    x = d.sample_from_discretized_mix_logistic(params)
-
-
-def test_wrapped_sample():
-    torch_sample_from_discretized_mix_logistic_rgb = jax2torch(sample_from_discretized_mix_logistic_rgb)
-    params = torch.ones((2, 30, 4, 5))
-    nr_mix = torch.tensor([3], dtype=torch.int32)
-    seed = torch.tensor([0], dtype=torch.int32)
-    sample = torch_sample_from_discretized_mix_logistic_rgb(seed, params, nr_mix)
-    from matplotlib import pyplot as plt
-    plt.imshow(sample[0])
-    plt.show()
 
 
 def test_dmlrgb_refactor():
@@ -181,7 +147,7 @@ def test_condition_rgb_means():
     means = torch.from_numpy(means)
     coeffs = torch.from_numpy(coeffs)
 
-    t_cond_means = du.condition_rgb_means(x, means, coeffs)
+    t_cond_means, dist_means = du.condition_rgb_means(x, means, coeffs)
 
     assert cond_means.shape == t_cond_means.shape
     assert np.allclose(cond_means, t_cond_means.numpy())
@@ -256,16 +222,130 @@ def test_discretized_mix_logistic_rgb():
     assert np.allclose(t_log_probs.numpy(), log_probs)
     assert means.shape == (2, 3, 4, 5)
 
+
+def test_refactor_sample_from_discretized_mix_logistic_rgb():
+    def sample_from_discretized_mix_logistic_rgb(seed, params, nr_mix):
+        params = jnp.transpose(params, (0, 2, 3, 1))
+        # had to hack the signature to get jax to take integers!
+
+        rng = jax.random.PRNGKey(seed)
+
+        """Sample from discretized mix logistic distribution."""
+        xshape = params.shape[:-1] + (3,)
+        batchsize, height, width, _ = xshape
+
+        # unpack parameters
+        pi_logits = params[:, :, :, :nr_mix]
+        remaining_params = params[:, :, :, nr_mix:].reshape(*xshape, nr_mix * 3)
+
+        # sample mixture indicator from softmax
+        rng1, rng2 = jax.random.split(rng)
+        mixture_idcs = dujax.sample_categorical(rng1, pi_logits)
+
+        onehot_values = dujax.onehot(mixture_idcs, nr_mix)
+
+        assert onehot_values.shape == (batchsize, height, width, nr_mix)
+
+        selection = onehot_values.reshape(xshape[:-1] + (1, nr_mix))
+
+        # select logistic parameters
+        means = jnp.sum(remaining_params[:, :, :, :, :nr_mix] * selection, axis=4)
+        pre_act_scales = jnp.sum(
+            remaining_params[:, :, :, :, nr_mix:2 * nr_mix] * selection, axis=4)
+
+        coeffs = jnp.sum(jax.nn.tanh(
+            remaining_params[:, :, :, :, 2 * nr_mix:3 * nr_mix]) * selection, axis=4)
+
+        u = jax.random.uniform(rng2, means.shape, minval=1e-5, maxval=1. - 1e-5)
+
+        standard_logistic = jnp.log(u) - jnp.log(1. - u)
+        scale = 1. / jax.nn.softplus(pre_act_scales)
+        x = means + scale * standard_logistic
+
+        x0 = jnp.clip(x[:, :, :, 0], a_min=-1., a_max=1.)
+        # TODO(emielh) although this is typically how it is implemented, technically
+        # one should first round x0 to the grid before using it. It does not matter
+        # too much since it is only used linearly.
+        x1 = jnp.clip(x[:, :, :, 1] + coeffs[:, :, :, 0] * x0, a_min=-1., a_max=1.)
+        x2 = jnp.clip(
+            x[:, :, :, 2] + coeffs[:, :, :, 1] * x0 + coeffs[:, :, :, 2] * x1,
+            a_min=-1., a_max=1.)
+
+        sample_x = jnp.concatenate(
+            [x0[:, :, :, None], x1[:, :, :, None], x2[:, :, :, None]], axis=3)
+        sample_x = jnp.transpose(sample_x, (0, 3, 1, 2))
+
+        return sample_x
+
+    params = np.random.uniform(size=(2, 30, 4, 5)).astype(np.float32)
+    seed, nr_mix = 0, 3
+    x = sample_from_discretized_mix_logistic_rgb(seed, params, nr_mix)
+    x_ = dujax.sample_from_discretized_mix_logistic_rgb(seed, params, nr_mix)
+    assert np.allclose(x, x_)
+
+
+def test_standard_logistic():
+    u = np.random.uniform(size=(2, 4, 5, 3)).astype(np.float32)
+    means = np.random.uniform(size=(2, 4, 5, 3)).astype(np.float32)
+    log_scales = np.random.uniform(size=(2, 4, 5, 3)).astype(np.float32)
+    x = dujax.standard_logistic(u, means, log_scales)
+
+    u = torch.from_numpy(u)
+    means = torch.from_numpy(means)
+    log_scales = torch.from_numpy(log_scales)
+    t_x = du.standard_logistic(u, means, log_scales)
+
+    assert np.allclose(t_x.numpy(), x, atol=1e-6)
+
+
+def test_color_subpixels():
+    x = np.random.uniform(size=(2, 4, 5, 3)).astype(np.float32)
+    coeffs = np.random.uniform(size=(2, 4, 5, 3)).astype(np.float32)
+
+    sample = dujax.color_subpixels(x, coeffs)
+
+    x = torch.from_numpy(x)
+    coeffs = torch.from_numpy(coeffs)
+
+    t_sample = du.color_subpixels(x, coeffs)
+
+    assert sample.shape == t_sample.shape
+    assert np.allclose(sample, t_sample.numpy(), atol=1e-6)
+
+
+def test_select_logistic():
+    nr_mix = 3
+    selection = np.random.uniform(size=(2, 4, 5, 1, nr_mix)).astype((np.float32))
+    means = np.random.uniform(size=(2, 4, 5, 3, nr_mix)).astype((np.float32))
+    log_scales = np.random.uniform(size=(2, 4, 5, 3, nr_mix)).astype((np.float32))
+    coeffs = np.random.uniform(size=(2, 4, 5, 3, nr_mix)).astype((np.float32))
+
+    j_means, j_scales, j_coeffs = dujax.select_logistic(selection, means, log_scales, coeffs)
+
+    selection = torch.from_numpy(selection)
+    means = torch.from_numpy(means)
+    log_scales = torch.from_numpy(log_scales)
+    coeffs = torch.from_numpy(coeffs)
+
+    t_means, t_scales, t_coeffs = du.select_logistic(selection, means, log_scales, coeffs)
+
+    assert np.allclose(j_means, t_means.numpy())
+    assert np.allclose(j_scales, t_scales.numpy())
+    assert np.allclose(j_coeffs, t_coeffs.numpy())
+
+
 def test_sample_discrete_mix_logistic_rgb():
     params = np.random.uniform(size=(2, 30, 4, 5)).astype(np.float32)
     params = torch.from_numpy(params)
 
-    x = du.sample_from_discretized_mix_logistic(params)
+    x = du.sample_from_discretized_mix_logistic_rgb(params)
+
     assert x.shape == (2, 3, 4, 5)
     from matplotlib import pyplot as plt
+
     def to_image(x):
         x = x + 1
         x = x * 255 / 2
         return x.numpy().astype(np.uint8)
-    plt.imshow(to_image(x[0].permute(1, 2, 0)))
-    plt.show()
+    # plt.imshow(to_image(x[0].permute(1, 2, 0)))
+    # plt.show()
