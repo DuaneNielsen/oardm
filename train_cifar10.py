@@ -15,6 +15,7 @@ import torch.distributions as dst
 import torch.nn.functional as F
 from distribution_utils import discretized_mix_logistic_rgb as disc_mix_logistic_rgb
 from distribution_utils import sample_from_discretized_mix_logistic_rgb as sample_disc_mix_logistic_rgb
+from tqdm import tqdm
 
 
 rescale_color = lambda x: (x + 1.) / 2.
@@ -64,21 +65,8 @@ class Plot(pl.Callback):
             ]
             self.draw()
 
-    def on_validation_batch_end(
-            self,
-            trainer: "pl.Trainer",
-            pl_module: "pl.LightningModule",
-            outputs,
-            batch: Any,
-            batch_idx: int,
-            dataloader_idx: int,
-    ) -> None:
-        self.samples += [rescale_color(s) for s in outputs['sample']]
-
     def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         self.draw()
-        del self.samples
-        self.samples = []
 
 
 class WandbPlot(pl.Callback):
@@ -122,13 +110,6 @@ class WandbPlot(pl.Callback):
         loss, x, x_m, x_ = outputs['loss'], outputs['input'], outputs['masked_input'], outputs['generated']
         panel = self.make_step_panel(x, x_m, x_)
         trainer.logger.experiment.log({"val_panel": wandb.Image(panel)})
-        self.samples += [rescale_color(s).clamp(0., 1.) for s in outputs['sample']]
-
-    def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
-        samples = make_grid(self.samples)
-        trainer.logger.experiment.log({"samples": wandb.Image(samples)})
-        del self.samples
-        self.samples = []
 
 
 def mix_logistic_dist(pi, loc, scale):
@@ -145,6 +126,33 @@ def mix_logistic_dist(pi, loc, scale):
     return dst.MixtureSameFamily(pi_dist, logistic_dist), torch.sum(pi.exp() * loc, dim=-1)
 
 
+def to_uint8(img):
+    return ((img.clamp(-1., 1.) + 1) * 255 / 2).to(dtype=torch.uint8)
+
+
+class GenerateAndTest(pl.Callback):
+    def __init__(self, sample_n):
+        super().__init__()
+        self.sample_n = sample_n
+        self.fid = FID()
+        self.initialized = False
+
+    def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        self.fid = self.fid.to(pl_module.device)
+        if not self.initialized:
+            for dl in trainer.val_dataloaders:
+                for b in tqdm(dl):
+                    self.fid.update(to_uint8(b[0]).to(pl_module.device), real=True)
+            self.initialized = True
+
+        sample = pl_module.sample(self.sample_n)
+        self.fid.fake_features.clear()
+        self.fid.update(to_uint8(sample), real=False)
+        score = self.fid.compute().item()
+        samples = make_grid([rescale_color(s) for s in sample])
+        trainer.logger.experiment.log({'FID': score, "samples": wandb.Image(samples)})
+
+
 class AODM(pl.LightningModule):
     def __init__(self, h, w, num_mix, lr=1e-4):
         super().__init__()
@@ -154,7 +162,6 @@ class AODM(pl.LightningModule):
         self.d = self.h * self.w
         self.unet = UNet(num_classes=10 * num_mix, input_channels=3, features_start=128)
         self.lr = lr
-        self.fid = FID()
 
     def forward(self, x):
         return self.unet(x)
@@ -199,21 +206,10 @@ class AODM(pl.LightningModule):
             x, label = batch[0], batch[1]
             x = x * 2 - 1.  # rescale from 0 .. 1 to -1 .. 1
             ln, mask, masked_x, x_ = self._step(x)
-            N = x.shape[0]
-            sample = self.sample(N)
-
-            def to_uint8(img):
-                return ((img.clamp(-1., 1.) + 1) * 255 / 2).to(dtype=torch.uint8)
-
-            self.fid.update(to_uint8(x), real=True)
-            self.fid.update(to_uint8(sample), real=False)
-            return {'loss': -ln.mean(), 'sample': sample.cpu(), 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
+            return {'loss': -ln.mean(), 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
 
     def validation_step_end(self, o):
         self.log('val_loss', o['loss'])
-
-    def validation_epoch_end(self, outputs):
-        self.log('FID', self.fid.compute())
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.unet.parameters(), lr=self.lr, weight_decay=0.)
@@ -361,7 +357,7 @@ if __name__ == '__main__':
         dm = CIFAR10DataModule.from_argparse_args(args)
         checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=100)
 
-        callbacks = [WandbPlot(), checkpoint_callback]
+        callbacks = [WandbPlot(), checkpoint_callback, GenerateAndTest(sample_n=64)]
 
         if args.matplotlib:
             callbacks.append(Plot())
