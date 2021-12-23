@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from distribution_utils import discretized_mix_logistic_rgb as disc_mix_logistic_rgb
 from distribution_utils import sample_from_discretized_mix_logistic_rgb as sample_disc_mix_logistic_rgb
 from tqdm import tqdm
+from math import log
 
 
 rescale_color = lambda x: (x + 1.) / 2.
@@ -154,7 +155,7 @@ class GenerateAndTest(pl.Callback):
 
 
 class AODM(pl.LightningModule):
-    def __init__(self, h, w, num_mix, lr=1e-4):
+    def __init__(self, h, w, num_mix, lr=1e-4, ce_coeff=0.001):
         super().__init__()
         self.save_hyperparameters()
         self.c, self.h, self.w, self.num_mix = 3, h, w, num_mix
@@ -162,6 +163,7 @@ class AODM(pl.LightningModule):
         self.d = self.h * self.w
         self.unet = UNet(num_classes=10 * num_mix, input_channels=3, features_start=128)
         self.lr = lr
+        self.ce_coeff = 0.001
 
     def forward(self, x):
         return self.unet(x)
@@ -190,13 +192,15 @@ class AODM(pl.LightningModule):
         l = ~mask.squeeze() * log_prob
         n = 1. / (self.d - t + 1.)
         ln = n * l.sum(dim=(1, 2), keepdims=True)
-        return ln, mask, masked_x, x_
+        return ln, log_prob, mask, masked_x, x_
 
     def training_step(self, batch, batch_idx):
         x, label = batch[0], batch[1]
         x = x * 2 - 1.  # rescale from 0 .. 1 to -1 .. 1
-        ln, mask, masked_x, x_ = self._step(x)
-        return {'loss': -ln.mean(), 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
+        ln, log_prob, mask, masked_x, x_ = self._step(x)
+        loss = ln.mean() + self.ce_coeff * log_prob.mean()
+        loss = -loss / self.d / log(2.)
+        return {'loss': loss, 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
 
     def training_step_end(self, o):
         self.log('loss', o['loss'])
@@ -205,8 +209,10 @@ class AODM(pl.LightningModule):
         with torch.no_grad():
             x, label = batch[0], batch[1]
             x = x * 2 - 1.  # rescale from 0 .. 1 to -1 .. 1
-            ln, mask, masked_x, x_ = self._step(x)
-            return {'loss': -ln.mean(), 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
+            ln, log_prob, mask, masked_x, x_ = self._step(x)
+            loss = ln.mean() + self.ce_coeff * log_prob.mean()
+            loss = -loss / self.d / log(2.)
+            return {'loss': loss, 'input': x.detach(), 'masked_input': masked_x.detach(), 'generated': x_.detach()}
 
     def validation_step_end(self, o):
         self.log('val_loss', o['loss'])
