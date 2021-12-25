@@ -223,6 +223,42 @@ def test_discretized_mix_logistic_rgb():
     assert means.shape == (2, 3, 4, 5)
 
 
+def test_discretized_mix_logistic_rgb_for_nan():
+
+    x = np.random.uniform(size=(2, 3, 4, 5)).astype(np.float32) * 2. - 1.
+    mn = np.finfo(np.float32).min
+    params = np.full((2, 30, 4, 5), mn)
+    gridsize = 1. / (256 - 1.)
+
+    log_probs = dujax.discretized_mix_logistic_rgb(x, params, gridsize)
+
+    x = torch.from_numpy(x)
+    params = torch.from_numpy(params)
+
+    t_log_probs, means = du.discretized_mix_logistic_rgb(x, params, gridsize)
+
+    assert t_log_probs.shape == log_probs.shape
+    assert np.allclose(t_log_probs.numpy(), log_probs)
+    assert means.shape == (2, 3, 4, 5)
+    assert ~t_log_probs.isnan().any()
+    assert ~means.isnan().any()
+
+    mx = np.finfo(np.float32).max / 1e4
+    params = np.full((2, 30, 4, 5), mx)
+    params = torch.from_numpy(params)
+    t_log_probs, means = du.discretized_mix_logistic_rgb(x, params, gridsize)
+
+    assert ~t_log_probs.isnan().any()
+    assert ~means.isnan().any()
+
+    params = np.zeros((2, 30, 4, 5), mx)
+    params = torch.from_numpy(params)
+    t_log_probs, means = du.discretized_mix_logistic_rgb(x, params, gridsize)
+
+    assert ~t_log_probs.isnan().any()
+    assert ~means.isnan().any()
+
+
 def test_refactor_sample_from_discretized_mix_logistic_rgb():
     def sample_from_discretized_mix_logistic_rgb(seed, params, nr_mix):
         params = jnp.transpose(params, (0, 2, 3, 1))

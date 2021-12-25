@@ -17,7 +17,15 @@ from distribution_utils import discretized_mix_logistic_rgb as disc_mix_logistic
 from distribution_utils import sample_from_discretized_mix_logistic_rgb as sample_disc_mix_logistic_rgb
 from tqdm import tqdm
 from math import log
+import logging
+from models.unet_plus_attn.model import get_vanila_unet_model
+from models.unet_plus_attn.model import get_unet_attention_decoder
+from models.unet_plus_attn.model import get_unet_attention_with_skip_connections_decoder
+from models.unet_plus_attn.model import get_unet_depthwise_encoder_attention_with_skip_connections_decoder
 
+
+
+logger = logging.getLogger('lightning')
 
 rescale_color = lambda x: (x + 1.) / 2.
 
@@ -76,9 +84,17 @@ class WandbPlot(pl.Callback):
         self.training_images = []
         self.samples = []
 
+    def detect_and_fix_nan(self, *args):
+        for i, arg in enumerate(args):
+            if arg.isnan().any():
+                arg[arg.isnan()] = 0.  # get rid of nans
+                logger.error(f'while making panel nans detected in arg {i}')
+        return args
+
     def make_step_panel(self, x, x_m, x_):
         N = x.shape[0]
         x, x_m, x_ = rescale_color(x), rescale_color(x_m), rescale_color(x_)
+        x, x_m, x_ = self.detect_and_fix_nan(x, x_m, x_)
         training_input = make_grid(x.cpu().clamp(0, 1), nrow=N)
         masked_input = make_grid(x_m.cpu().clamp(0, 1), nrow=N)
         training_output = make_grid(x_.cpu().clamp(0, 1), nrow=N)
@@ -137,19 +153,36 @@ class GenerateAndTest(pl.Callback):
         self.sample_n = sample_n
         self.fid = FID()
         self.initialized = False
+        self.model_device = 'cpu'
+
+    def switch_device(self, pl_module):
+        """
+        FID inception network uses quite a bit of gpu memory, so switch it onto gpu only when required
+        """
+        if self.fid.device.type == 'cpu':
+            self.model_device = pl_module.device
+            pl_module = pl_module.cpu()
+            self.fid = self.fid.to(self.model_device)
+        else:
+            self.fid = self.fid.cpu()
+            pl_module = pl_module.to(self.model_device)
+        return pl_module
 
     def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
-        self.fid = self.fid.to(pl_module.device)
         if not self.initialized:
+            pl_module = self.switch_device(pl_module)
             for dl in trainer.val_dataloaders:
                 for b in tqdm(dl):
-                    self.fid.update(to_uint8(b[0]).to(pl_module.device), real=True)
+                    self.fid.update(to_uint8(b[0]).to(self.fid.device), real=True)
             self.initialized = True
+            pl_module = self.switch_device(pl_module)
 
         sample = pl_module.sample(self.sample_n)
+        pl_module = self.switch_device(pl_module)
         self.fid.fake_features.clear()
         self.fid.update(to_uint8(sample), real=False)
         score = self.fid.compute().item()
+        pl_module = self.switch_device(pl_module)
         samples = make_grid([rescale_color(s) for s in sample])
         trainer.logger.experiment.log({'FID': score, "samples": wandb.Image(samples)})
 
@@ -161,9 +194,12 @@ class AODM(pl.LightningModule):
         self.c, self.h, self.w, self.num_mix = 3, h, w, num_mix
         self.gridsize = 1. / (256 - 1.)
         self.d = self.h * self.w
-        self.unet = UNet(num_classes=10 * num_mix, input_channels=3, features_start=128)
+        #self.unet = UNet(num_classes=10 * num_mix, input_channels=3, features_start=160)
+        #self.unet = get_vanila_unet_model(in_dim=3, out_dim=10 * num_mix)
+        self.unet = get_unet_attention_decoder(in_dim=3, out_dim=10 * num_mix)
+
         self.lr = lr
-        self.ce_coeff = 0.001
+        self.ce_coeff = ce_coeff
 
     def forward(self, x):
         return self.unet(x)
@@ -362,6 +398,10 @@ if __name__ == '__main__':
         pl.seed_everything(1234)
         dm = CIFAR10DataModule.from_argparse_args(args)
         checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=100)
+
+        logger.error('INIT error log')
+        logger.info('INIT info log')
+        logger.debug('INIT debug log')
 
         callbacks = [WandbPlot(), checkpoint_callback, GenerateAndTest(sample_n=64)]
 
