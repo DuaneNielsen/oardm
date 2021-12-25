@@ -1,6 +1,9 @@
 import torch
 from torch.nn.functional import softplus
 from torch.distributions import OneHotCategorical
+import logging
+
+logger = logging.getLogger('lightning')
 
 
 def unpack_params(params, nr_mix):
@@ -32,8 +35,9 @@ def condition_rgb_means(x, means, coeffs):
 
 
 def discretize(x, means, scale, gridsize):
+    eps = torch.finfo(scale.dtype).eps
     centered_x = x - means
-    inv_stdv = softplus(scale)
+    inv_stdv = softplus(scale) + eps
     plus_in = inv_stdv * (centered_x + gridsize)
     cdf_plus = torch.sigmoid(plus_in)
     min_in = inv_stdv * (centered_x - gridsize)
@@ -44,6 +48,20 @@ def discretize(x, means, scale, gridsize):
     # log probability for leftmost grid value, tail of distribution
     log_one_minus_cdf_min = - softplus(min_in)
     cdf_delta = cdf_plus - cdf_min  # probability for all other cases
+
+    # if inv_stdv.isnan().any():
+    #     logger.error('inv_stdv is nan')
+    # if cdf_delta.isnan().any():
+    #     logger.error('cdf_delta is nan')
+    # if log_one_minus_cdf_min.isnan().any():
+    #     logger.error('log_one_minus_cdf_min is nan')
+    # if log_cdf_plus.isnan().any():
+    #     logger.error('log_cdf_plus is nan')
+    # if cdf_plus.isnan().any():
+    #     logger.error('cdf_plus is nan')
+    # if cdf_min.isnan().any():
+    #     logger.error('cdf_min is nan')
+
     return log_cdf_plus, log_one_minus_cdf_min, cdf_delta
 
 
@@ -85,6 +103,10 @@ def discretized_mix_logistic_rgb(x, params, gridsize):
     assert log_probs.shape == (N, H, W, C, nr_mix)
 
     log_pi = torch.log_softmax(pi_logits, dim=-1)
+
+    # if log_pi.isnan().any():
+    #     logger.error('log_pi is nan')
+
     log_probs = torch.logsumexp(log_probs + log_pi[..., None, :], dim=-1)
 
     assert log_probs.shape == (N, H, W, C)
@@ -93,7 +115,10 @@ def discretized_mix_logistic_rgb(x, params, gridsize):
 
     assert log_probs.shape == (N, H, W)
 
-    return log_probs, torch.sum(pi_logits.unsqueeze(-2).exp() * dist_means, dim=-1).permute(0, 3, 1, 2)
+    mix_dist_means = log_pi.exp().unsqueeze(-2) * dist_means
+    mix_dist_means = mix_dist_means.sum(-1).permute(0, 3, 1, 2)
+
+    return log_probs, mix_dist_means
 
 
 def select_logistic(selection, means, log_scales, coeffs):
@@ -104,8 +129,11 @@ def select_logistic(selection, means, log_scales, coeffs):
 
 
 def standard_logistic(u, means, log_scales):
+    eps = torch.finfo(log_scales.dtype).eps
     standard_logistic = torch.log(u) - torch.log(1. - u)
-    scale = 1. / softplus(log_scales)
+    scale = 1. / (softplus(log_scales) + eps)
+    # if scale.isnan().any():
+    #     logger.error('standard_logistic scale is nan')
     x = means + scale * standard_logistic
     return x
 
